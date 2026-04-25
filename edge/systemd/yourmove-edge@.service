@@ -1,0 +1,15 @@
+[Unit]
+Description=yourmove edge supervisor (%i)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/amir/websites/yourmove/edge/run_edge_supervisor.sh %h/.config/yourmove-edge/%i.json
+Restart=always
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+.DS_Store
+
+# Local firmware config copies
+device/esp32_direct/config.h
+device/esp32_prebuilt/config.h
+
+# Local edge runtime state
+*.log
+*.local.json
+.local/
+state/
+
+# Optional local model weights
+*.pt
