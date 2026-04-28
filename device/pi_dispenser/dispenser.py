@@ -212,16 +212,17 @@ class PiDispenser:
 
     def _handle_dispense(self, command_id: str, payload: dict):
         now = time.time()
-        with self.state.lock:
-            elapsed = now - self.state.last_dispense_at
-            if elapsed < COOLDOWN_S:
-                log.info("Rejecting %s: cooldown (%.1fs elapsed, need %.1fs)", command_id, elapsed, COOLDOWN_S)
-                self._reject(command_id, "dispense", "cooldown")
-                return
-            log.info("Accepting dispense %s (state=%s, elapsed=%.1fs)", command_id, self.state.state, elapsed)
-
         duration = payload.get("duration_ms", DEFAULT_DURATION_MS)
         duration = max(50, min(duration, MAX_DURATION_MS))
+        busy_seconds = duration / 1000.0 + COOLDOWN_S
+        with self.state.lock:
+            elapsed = now - self.state.last_dispense_at
+            if elapsed < busy_seconds:
+                log.info("Rejecting %s: busy (%.1fs elapsed, need %.1fs)", command_id, elapsed, busy_seconds)
+                self._reject(command_id, "dispense", "cooldown")
+                return
+            self.state.last_dispense_at = now
+            log.info("Accepting dispense %s (state=%s, elapsed=%.1fs)", command_id, self.state.state, elapsed)
 
         ack = {"command_id": command_id, "type": "dispense", "status": "accepted", "timestamp": _utc_ts()}
         self._publish("ack", ack)
@@ -237,7 +238,6 @@ class PiDispenser:
                     log.error("Dispense failed: %s", e)
                     self.state.last_error = str(e)
                 with self.state.lock:
-                    self.state.last_dispense_at = time.time()
                     self.state.last_completed_command_id = command_id
                     self.state.state = "cooldown"
                 result = {"command_id": command_id, "type": "dispense", "status": "completed", "timestamp": _utc_ts()}
