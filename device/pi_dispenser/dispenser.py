@@ -188,14 +188,18 @@ class PiDispenser:
         if not command_id or not command_type:
             return
 
+        log.info("Received command %s type=%s state=%s", command_id, command_type, self.state.state)
+
         with self.state.lock:
             if command_id in self.state.recent_commands:
+                log.info("Replaying cached response for %s", command_id)
                 ack, result = self.state.recent_commands[command_id]
                 self._publish("ack", ack)
                 self._publish("result", result)
                 return
 
         if expires_at and _utc_ts() > expires_at:
+            log.warning("Command %s expired (expires_at=%s now=%s)", command_id, expires_at, _utc_ts())
             self._reject(command_id, command_type, "expired")
             return
 
@@ -209,9 +213,12 @@ class PiDispenser:
     def _handle_dispense(self, command_id: str, payload: dict):
         now = time.time()
         with self.state.lock:
-            if now - self.state.last_dispense_at < COOLDOWN_S:
+            elapsed = now - self.state.last_dispense_at
+            if elapsed < COOLDOWN_S:
+                log.info("Rejecting %s: cooldown (%.1fs elapsed, need %.1fs)", command_id, elapsed, COOLDOWN_S)
                 self._reject(command_id, "dispense", "cooldown")
                 return
+            log.info("Accepting dispense %s (state=%s, elapsed=%.1fs)", command_id, self.state.state, elapsed)
 
         duration = payload.get("duration_ms", DEFAULT_DURATION_MS)
         duration = max(50, min(duration, MAX_DURATION_MS))
