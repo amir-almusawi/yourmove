@@ -201,7 +201,6 @@ class PiDispenser:
             os._exit(1)
 
     def _on_message_enqueue(self, client, userdata, msg):
-        """Thin callback — just parse and enqueue so paho's loop thread stays free."""
         try:
             data = json.loads(msg.payload)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -210,10 +209,11 @@ class PiDispenser:
         command_type = data.get("type")
         if not command_id or not command_type:
             return
+        log.info("Enqueued %s type=%s qsize=%d", command_id, command_type, self._cmd_queue.qsize())
         self._cmd_queue.put(data)
 
     def _command_worker(self):
-        """Processes commands off the loop thread so paho can keep sending PINGREQs."""
+        log.info("Command worker started")
         while True:
             data = self._cmd_queue.get()
             try:
