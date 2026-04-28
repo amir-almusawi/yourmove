@@ -329,3 +329,21 @@ def test_evaluate_interaction_prefers_shot_probe_miss():
     assert result["event"] == "miss"
     assert result["score"]["final"] == 5
     assert result["detection"]["source"] == "shot_classifier"
+
+
+def test_resolve_shot_context_returns_crosshair_without_active_shot_model():
+    from edge.edge_cv_runtime import resolve_shot_context
+
+    frame = object()
+    aim_config = {"pan": 0.0, "tilt": 0.0}
+
+    with patch("edge.edge_cv_score.pan_tilt_to_crosshair", return_value=(0.42, 0.58)):
+        crosshair, shot_probe = resolve_shot_context(
+            frame,
+            aim_config,
+            scoring_config={},
+            cv_settings={},
+        )
+
+    assert crosshair == (0.42, 0.58)
+    assert shot_probe is None

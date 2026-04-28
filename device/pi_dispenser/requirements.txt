@@ -1,4 +1,4 @@
-paho-mqtt>=1.6,<2
+gmqtt>=0.6.0
 flask>=3.0
 requests>=2.28
 gpiozero>=2.0

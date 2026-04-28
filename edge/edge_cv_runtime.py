@@ -784,6 +784,47 @@ def extract_and_upload_shot_crops(
     return stats
 
 
+def resolve_shot_context(
+    frame,
+    aim_config,
+    scoring_config: dict | None = None,
+    cv_settings: dict | None = None,
+) -> tuple[tuple[float, float] | None, dict | None]:
+    """Resolve crosshair position and optional shot-classifier probe.
+
+    Crosshair computation must stay independent from shot-model activation so a
+    new node can still collect shot crops before the first shot model exists.
+    """
+    scoring_config = scoring_config or {}
+    cv_settings = cv_settings or {}
+    if aim_config is None or frame is None:
+        return None, None
+
+    try:
+        from edge.edge_cv_score import pan_tilt_to_crosshair
+        crosshair = pan_tilt_to_crosshair(aim_config)
+    except Exception as exc:
+        log.warning("shot_crosshair_failed: %s", exc)
+        return None, None
+
+    if not cv_settings.get("active_shot_model_key"):
+        return crosshair, None
+
+    shot_probe = None
+    try:
+        from edge.edge_cv_shot import classify_crosshair_shot, shot_classifier_loaded
+        if shot_classifier_loaded():
+            shot_probe = classify_crosshair_shot(
+                frame,
+                crosshair,
+                scoring_config=scoring_config,
+                cv_settings=cv_settings,
+            )
+    except Exception as exc:
+        log.warning("shot_probe_failed: %s", exc)
+    return crosshair, shot_probe
+
+
 def main() -> int:
     global _rtsp_source
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
@@ -1241,22 +1282,12 @@ def main() -> int:
         capture_stats["quota_used"] = max(0, quota_total - quota_remaining)
 
         def _score_fire(interaction_id, aim_config):
-            shot_probe = None
-            crosshair = None
-            if aim_config and detection_state.get("frame") is not None and cv_settings.get("active_shot_model_key"):
-                try:
-                    from edge.edge_cv_score import pan_tilt_to_crosshair
-                    from edge.edge_cv_shot import classify_crosshair_shot, shot_classifier_loaded
-                    crosshair = pan_tilt_to_crosshair(aim_config)
-                    if shot_classifier_loaded():
-                        shot_probe = classify_crosshair_shot(
-                            detection_state["frame"],
-                            crosshair,
-                            scoring_config=game_config.get("template_config", {}).get("scoring", {}),
-                            cv_settings=(game_config or {}).get("cv_settings", {}),
-                        )
-                except Exception as exc:
-                    log.warning("shot_probe_failed: %s", exc)
+            crosshair, shot_probe = resolve_shot_context(
+                detection_state.get("frame"),
+                aim_config,
+                scoring_config=game_config.get("template_config", {}).get("scoring", {}),
+                cv_settings=(game_config or {}).get("cv_settings", {}),
+            )
             live_state = {
                 "targets": detection_state.get("targets", []),
                 "all_detections": detection_state.get("all_detections", []),
