@@ -335,32 +335,39 @@ class PiDispenser:
         try:
             err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
             if err != 0:
-                log.error("Socket error detected: %d", err)
+                log.error("Socket SO_ERROR=%d", err)
                 return False
         except OSError:
             return False
         try:
-            sock.getpeername()
-        except OSError:
+            data = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            if data == b"":
+                log.error("Socket EOF (remote closed)")
+                return False
+        except BlockingIOError:
+            pass
+        except OSError as e:
+            log.error("Socket recv probe failed: %s", e)
             return False
         return True
 
     def _telemetry_loop(self):
         while True:
-            time.sleep(TELEMETRY_INTERVAL_S)
+            time.sleep(5)
             if not self._check_socket_health():
                 log.error("Socket health check failed, exiting for systemd restart")
                 os._exit(1)
-            try:
-                self._publish("telemetry", self.get_telemetry(), qos=0)
-            except Exception as e:
-                log.error("Telemetry publish failed (%s), exiting for systemd restart", e)
-                os._exit(1)
-            self._publish("presence", {
-                "state": "online", "runtime_type": "pi_gateway",
-                "reason": "heartbeat", "timestamp": _utc_ts(),
-            }, retain=True)
-            self._report_presence_http("online")
+            if int(time.time() - self.state.startup_time) % TELEMETRY_INTERVAL_S < 5:
+                try:
+                    self._publish("telemetry", self.get_telemetry(), qos=0)
+                except Exception as e:
+                    log.error("Telemetry publish failed (%s), exiting for systemd restart", e)
+                    os._exit(1)
+                self._publish("presence", {
+                    "state": "online", "runtime_type": "pi_gateway",
+                    "reason": "heartbeat", "timestamp": _utc_ts(),
+                }, retain=True)
+                self._report_presence_http("online")
 
     def run(self):
         log.info("Connecting to MQTT %s:%d as node %d",
