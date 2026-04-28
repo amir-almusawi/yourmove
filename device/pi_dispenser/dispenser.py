@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import signal
 import socket
 import sys
@@ -51,6 +52,7 @@ class PiDispenser:
         self.node_id = config["mqtt_node_id"]
         self.adapter = adapter
         self.state = DispenserState()
+        self._cmd_queue = queue.Queue()
         self.client = mqtt.Client(
             client_id=f"yourmove-pi-{config.get('hardware_serial', 'unknown')}",
             clean_session=True,
@@ -65,7 +67,7 @@ class PiDispenser:
         self.client.will_set(self._topic("presence"), lwt, qos=1, retain=True)
         self.client.on_connect = self.on_connect
         self.client.on_disconnect = self.on_disconnect
-        self.client.on_message = self.on_message
+        self.client.on_message = self._on_message_enqueue
         self.client.reconnect_delay_set(min_delay=1, max_delay=30)
 
     def _topic(self, suffix: str) -> str:
@@ -198,19 +200,34 @@ class PiDispenser:
             log.error("MQTT unexpected disconnect (rc=%d), exiting for systemd restart", rc)
             os._exit(1)
 
-    def on_message(self, client, userdata, msg):
+    def _on_message_enqueue(self, client, userdata, msg):
+        """Thin callback — just parse and enqueue so paho's loop thread stays free."""
         try:
             data = json.loads(msg.payload)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
         command_id = data.get("command_id")
         command_type = data.get("type")
-        payload = data.get("payload", {})
-        expires_at = data.get("expires_at")
         if not command_id or not command_type:
             return
+        self._cmd_queue.put(data)
 
-        log.info("Received command %s type=%s state=%s", command_id, command_type, self.state.state)
+    def _command_worker(self):
+        """Processes commands off the loop thread so paho can keep sending PINGREQs."""
+        while True:
+            data = self._cmd_queue.get()
+            try:
+                self._handle_command(data)
+            except Exception as e:
+                log.error("Command worker error: %s", e)
+
+    def _handle_command(self, data):
+        command_id = data["command_id"]
+        command_type = data["type"]
+        payload = data.get("payload", {})
+        expires_at = data.get("expires_at")
+
+        log.info("Processing command %s type=%s state=%s", command_id, command_type, self.state.state)
 
         with self.state.lock:
             if command_id in self.state.recent_commands:
@@ -374,8 +391,8 @@ class PiDispenser:
                  self.config["mqtt_host"], self.config["mqtt_port"], self.node_id)
         self.client.connect(self.config["mqtt_host"], self.config["mqtt_port"], keepalive=15)
 
-        tel_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
-        tel_thread.start()
+        threading.Thread(target=self._telemetry_loop, daemon=True).start()
+        threading.Thread(target=self._command_worker, daemon=True).start()
 
         def _shutdown(sig, frame):
             log.info("Shutting down (signal %s)", sig)
