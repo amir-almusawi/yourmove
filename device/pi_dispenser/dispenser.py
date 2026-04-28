@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -19,7 +21,7 @@ FIRMWARE_VERSION = "pi-dispenser-0.1.0"
 DEFAULT_DURATION_MS = 500
 MAX_DURATION_MS = 5000
 COOLDOWN_S = 5.0
-TELEMETRY_INTERVAL_S = 30
+TELEMETRY_INTERVAL_S = 15
 MAX_RECENT_COMMANDS = 50
 
 
@@ -165,11 +167,22 @@ class PiDispenser:
             pass
         return None
 
+    @staticmethod
+    def _set_tcp_keepalive(sock):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+
     def on_connect(self, client, userdata, flags, rc):
         if rc != 0:
             log.error("MQTT connect failed: rc=%d", rc)
             return
         log.info("MQTT connected, subscribing to commands")
+        sock = client.socket()
+        if sock:
+            self._set_tcp_keepalive(sock)
+            log.info("TCP keepalive set (idle=10s, intvl=5s, cnt=3)")
         client.subscribe(self._topic("commands"), qos=1)
         self._publish("presence", {
             "state": "online", "runtime_type": "pi_gateway",
@@ -182,7 +195,8 @@ class PiDispenser:
         if rc == 0:
             log.info("MQTT disconnected cleanly")
         else:
-            log.warning("MQTT unexpected disconnect (rc=%d), will auto-reconnect", rc)
+            log.error("MQTT unexpected disconnect (rc=%d), exiting for systemd restart", rc)
+            os._exit(1)
 
     def on_message(self, client, userdata, msg):
         try:
@@ -314,31 +328,34 @@ class PiDispenser:
         except Exception as e:
             log.debug("HTTP presence failed: %s", e)
 
+    def _check_socket_health(self) -> bool:
+        sock = self.client.socket()
+        if sock is None:
+            return False
+        try:
+            err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if err != 0:
+                log.error("Socket error detected: %d", err)
+                return False
+        except OSError:
+            return False
+        try:
+            sock.getpeername()
+        except OSError:
+            return False
+        return True
+
     def _telemetry_loop(self):
         while True:
             time.sleep(TELEMETRY_INTERVAL_S)
-            if not self.client.is_connected():
-                log.warning("MQTT not connected (is_connected=false), forcing reconnect")
-                try:
-                    self.client.reconnect()
-                except Exception as e:
-                    log.error("Reconnect failed: %s", e)
-                continue
+            if not self._check_socket_health():
+                log.error("Socket health check failed, exiting for systemd restart")
+                os._exit(1)
             try:
-                info = self.client.publish(
-                    self._topic("telemetry"),
-                    json.dumps(self.get_telemetry()),
-                    qos=0,
-                )
-                if info.rc != 0:
-                    raise RuntimeError(f"publish rc={info.rc}")
+                self._publish("telemetry", self.get_telemetry(), qos=0)
             except Exception as e:
-                log.warning("MQTT publish probe failed (%s), forcing reconnect", e)
-                try:
-                    self.client.reconnect()
-                except Exception as re:
-                    log.error("Reconnect failed: %s", re)
-                continue
+                log.error("Telemetry publish failed (%s), exiting for systemd restart", e)
+                os._exit(1)
             self._publish("presence", {
                 "state": "online", "runtime_type": "pi_gateway",
                 "reason": "heartbeat", "timestamp": _utc_ts(),
@@ -348,7 +365,7 @@ class PiDispenser:
     def run(self):
         log.info("Connecting to MQTT %s:%d as node %d",
                  self.config["mqtt_host"], self.config["mqtt_port"], self.node_id)
-        self.client.connect(self.config["mqtt_host"], self.config["mqtt_port"], keepalive=30)
+        self.client.connect(self.config["mqtt_host"], self.config["mqtt_port"], keepalive=15)
 
         tel_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
         tel_thread.start()
