@@ -215,7 +215,10 @@ class PiDispenser:
     def _command_worker(self):
         log.info("Command worker started")
         while True:
-            data = self._cmd_queue.get()
+            try:
+                data = self._cmd_queue.get(timeout=1)
+            except queue.Empty:
+                continue
             try:
                 self._handle_command(data)
             except Exception as e:
@@ -390,9 +393,9 @@ class PiDispenser:
         log.info("Connecting to MQTT %s:%d as node %d",
                  self.config["mqtt_host"], self.config["mqtt_port"], self.node_id)
         self.client.connect(self.config["mqtt_host"], self.config["mqtt_port"], keepalive=15)
+        self.client.loop_start()
 
         threading.Thread(target=self._telemetry_loop, daemon=True).start()
-        threading.Thread(target=self._command_worker, daemon=True).start()
 
         def _shutdown(sig, frame):
             log.info("Shutting down (signal %s)", sig)
@@ -408,7 +411,7 @@ class PiDispenser:
 
         signal.signal(signal.SIGINT, _shutdown)
         signal.signal(signal.SIGTERM, _shutdown)
-        self.client.loop_forever()
+        self._command_worker()
 
 
 def main():
