@@ -1,0 +1,22 @@
+{
+  "hardware_serial": "YM-PI-A1B2C3",
+  "provisioned": true,
+  "wifi_ssid": "HomeNetwork",
+  "wifi_password": "wifi-password-here",
+  "claim_code": "YM-ABCD1234",
+  "node_slug": "bird-rescue",
+  "mqtt_host": "yourmove.live",
+  "mqtt_port": 1883,
+  "mqtt_node_id": 42,
+  "mqtt_username": "node_xxx",
+  "mqtt_password": "mqtt-password-here",
+  "auth_token": "edge-auth-token-here",
+  "base_url": "https://yourmove.live",
+  "camera": {
+    "ip": "192.168.50.100",
+    "rtsp_main": "rtsp://yourmove:ym-A1B2C3D4@192.168.50.100:554/H.264/ch1/main/av_stream",
+    "rtsp_sub": "rtsp://yourmove:ym-A1B2C3D4@192.168.50.100:554/H.264/ch1/sub/av_stream",
+    "configured": true
+  },
+  "go2rtc_port": 8554
+}

@@ -11,15 +11,15 @@ It serves two audiences:
 
 Included here:
 
-- [`simulator.py`](/home/amir/websites/yourmove/device/simulator.py)
+- [`simulator.py`](./simulator.py)
   Runnable MQTT simulator for protocol and dashboard testing.
-- [`esp32_direct/yourmove_esp32_direct.ino`](/home/amir/websites/yourmove/device/esp32_direct/yourmove_esp32_direct.ino)
+- [`esp32_direct/yourmove_esp32_direct.ino`](./esp32_direct/yourmove_esp32_direct.ino)
   Reference Arduino-style ESP32 direct client for a pan/tilt/relay turret.
-- [`esp32_prebuilt/esp32_prebuilt.ino`](/home/amir/websites/yourmove/device/esp32_prebuilt/esp32_prebuilt.ino)
+- [`esp32_prebuilt/esp32_prebuilt.ino`](./esp32_prebuilt/esp32_prebuilt.ino)
   Setup-mode ESP32 firmware for prebuilt hardware with claim-code provisioning.
-- [`pi_gateway/gateway.py`](/home/amir/websites/yourmove/device/pi_gateway/gateway.py)
+- [`pi_gateway/gateway.py`](./pi_gateway/gateway.py)
   Runnable Raspberry Pi gateway skeleton with adapter hooks.
-- [`treat_dispenser/dispenser.py`](/home/amir/websites/yourmove/device/treat_dispenser/dispenser.py)
+- [`treat_dispenser/dispenser.py`](./treat_dispenser/dispenser.py)
   Non-turret starter that publishes a v2 capability snapshot and drives the dashboard's generic Setup controls.
 
 Design rule:

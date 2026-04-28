@@ -233,7 +233,7 @@ def fail_clip_job(base_url: str, node_slug: str, interaction_id: int, auth_token
         return False, str(exc)
 
 
-def post_edge_heartbeat(base_url: str, node_slug: str, auth_token: str, payload: dict, timeout_seconds: int, ssl_verify: bool) -> tuple[bool, str]:
+def post_edge_heartbeat(base_url: str, node_slug: str, auth_token: str, payload: dict, timeout_seconds: int, ssl_verify: bool) -> tuple[bool, dict]:
     try:
         response = requests.post(
             f"{base_url.rstrip('/')}/api/nodes/{node_slug}/operator/edge-heartbeat",
@@ -243,10 +243,52 @@ def post_edge_heartbeat(base_url: str, node_slug: str, auth_token: str, payload:
             verify=ssl_verify,
         )
         if response.ok:
-            return True, response.text
-        return False, f"http {response.status_code}: {response.text}"
+            try:
+                return True, response.json()
+            except Exception:
+                return True, {}
+        return False, {}
+    except Exception:
+        return False, {}
+
+
+def refresh_auth_token(
+    base_url: str, node_slug: str, device_secret: str,
+    config_path: Path, ssl_verify: bool, timeout_seconds: int = 10,
+) -> str | None:
+    """Call the platform to get a fresh JWT using the device secret."""
+    if not device_secret:
+        return None
+    try:
+        resp = requests.post(
+            f"{base_url.rstrip('/')}/api/internal/edge/token",
+            headers={"Authorization": f"Bearer {device_secret}"},
+            json={"node_slug": node_slug},
+            timeout=timeout_seconds,
+            verify=ssl_verify,
+        )
+        if not resp.ok:
+            log(f"token_refresh_failed status={resp.status_code}")
+            return None
+        new_token = resp.json().get("token")
+        if not new_token:
+            return None
+        try:
+            with open(config_path) as f:
+                cfg = json.load(f)
+            cfg["auth_token"] = new_token
+            with open(config_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception as exc:
+            log(f"token_config_write_failed error={exc}")
+        log("token_refreshed")
+        return new_token
     except Exception as exc:
-        return False, str(exc)
+        log(f"token_refresh_error error={exc}")
+        return None
+
+
+TOKEN_REFRESH_INTERVAL = 12 * 3600  # 12 hours
 
 
 def load_json(path: Path, default):
@@ -504,6 +546,73 @@ def restart_publisher(restart_command: str) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# Process-mode WHIP publisher (bare metal, no Docker)
+# ---------------------------------------------------------------------------
+
+_publisher_process: subprocess.Popen | None = None
+_whip_process = None  # alias for compat
+
+
+def start_publisher_process(config: dict, rtsp_source: str) -> tuple[bool, str]:
+    """Start ffmpeg to publish RTSP→RTMP to LiveKit, or whip-client for WHIP."""
+    global _publisher_process
+    stop_process(_publisher_process, "publisher")
+    _publisher_process = None
+
+    rtmp_url = config.get("rtmp_url", "")
+    rtmp_key = config.get("rtmp_key", "")
+
+    if rtmp_url and rtmp_key:
+        target = f"{rtmp_url.rstrip('/')}/{rtmp_key}"
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-rtsp_transport", "tcp", "-i", rtsp_source,
+            "-c:v", "copy", "-an", "-f", "flv", target,
+        ]
+        label = "ffmpeg-rtmp"
+    else:
+        whip_endpoint = config.get("whip_endpoint", "")
+        whip_token = config.get("whip_token", "")
+        if not whip_endpoint:
+            return False, "no rtmp_url or whip_endpoint configured"
+        video_pipeline = (
+            f"rtspsrc location={rtsp_source} protocols=tcp latency=20 drop-on-latency=true "
+            f"! rtph264depay ! h264parse config-interval=-1 "
+            f"! rtph264pay pt=96 config-interval=1 aggregate-mode=zero-latency "
+            f"! queue max-size-buffers=3 leaky=upstream"
+        )
+        cmd = [
+            "whip-client", "--url", whip_endpoint, "--video", video_pipeline,
+            "--no-trickle", "--stun-server", "stun://stun.l.google.com:19302", "--log-level", "4",
+        ]
+        if whip_token:
+            cmd.extend(["--token", whip_token])
+        label = "whip-client"
+
+    try:
+        log_path = Path(tempfile.gettempdir()) / f"{label}.log"
+        log_fh = log_path.open("a")
+        _publisher_process = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
+        return True, f"{label} pid={_publisher_process.pid} log={log_path}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+# Keep old names as aliases
+start_whip_process = start_publisher_process
+
+
+def whip_process_running() -> bool:
+    return _publisher_process is not None and _publisher_process.poll() is None
+
+
+def stop_whip_process() -> None:
+    global _publisher_process
+    stop_process(_publisher_process, "publisher")
+    _publisher_process = None
+
+
+# ---------------------------------------------------------------------------
 # go2rtc fan-out layer
 # ---------------------------------------------------------------------------
 
@@ -535,7 +644,7 @@ webrtc:
 
 def build_go2rtc_docker_command(config: dict, config_dir: Path) -> list[str]:
     """Build the docker run command for the go2rtc+GStreamer container."""
-    container_name = config["container_name"]
+    container_name = config.get("container_name", "")
     go2rtc_config_path = config_dir / "go2rtc.yaml"
     docker_image = config.get("go2rtc_image", "ym-edge-go2rtc:latest")
     whip_endpoint = config.get("whip_endpoint", "")
@@ -543,13 +652,14 @@ def build_go2rtc_docker_command(config: dict, config_dir: Path) -> list[str]:
     go2rtc_port = config.get("go2rtc_port", 8554)
     api_port = config.get("go2rtc_api_port", 1984)
 
-    sub_rtsp = f"rtsp://127.0.0.1:{go2rtc_port}/sub"
+    annotated_rtsp_port = config.get("annotated_rtsp_port")
+    whip_source = f"rtsp://127.0.0.1:{go2rtc_port}/sub"
     gst_pipeline = (
         f"gst-launch-1.0 -e -v "
-        f"rtspsrc location={sub_rtsp} protocols=tcp latency=50 drop-on-latency=true "
+        f"rtspsrc location={whip_source} protocols=tcp latency=20 drop-on-latency=true "
         f"! rtph264depay ! h264parse config-interval=-1 "
         f"! rtph264pay pt=96 config-interval=1 aggregate-mode=zero-latency "
-        f"! queue "
+        f"! queue max-size-buffers=3 leaky=upstream "
         f"! whipsink whip-endpoint={whip_endpoint} auth-token={whip_token} "
         f"stun-server=stun://stun.l.google.com:19302 use-link-headers=false"
     )
@@ -568,7 +678,7 @@ def build_go2rtc_docker_command(config: dict, config_dir: Path) -> list[str]:
 
 def start_go2rtc_container(config: dict, config_dir: Path) -> tuple[bool, str]:
     """Stop existing container if any, generate config, start new container."""
-    container_name = config["container_name"]
+    container_name = config.get("container_name", "")
 
     subprocess.run(
         ["docker", "rm", "-f", container_name],
@@ -646,14 +756,21 @@ def main() -> int:
 
     rtsp_url = config["rtsp_url"]
     restart_command = config.get("restart_command", "")
-    container_name = config["container_name"]
+    container_name = config.get("container_name", "")
     node_slug = config["node_slug"]
     base_url = config.get("base_url", "https://yourmove.live")
     auth_token = config.get("auth_token", "")
+    device_secret = config.get("device_secret", "")
+    last_token_refresh = 0.0
     probe_interval = int(config.get("probe_interval_seconds", 15))
     probe_timeout = int(config.get("probe_timeout_seconds", 6))
     ssl_verify = bool(config.get("ssl_verify", True))
     restart_cooldown = int(config.get("restart_cooldown_seconds", 20))
+
+    firmware_version = ""
+    version_path = Path("/etc/yourmove/version")
+    if version_path.exists():
+        firmware_version = version_path.read_text().strip()
     failure_threshold = int(config.get("failure_threshold", 2))
     clip_buffer_enabled = bool(config.get("clip_buffer_enabled", False))
     clip_pre_roll_seconds = float(config.get("clip_pre_roll_seconds", 3))
@@ -665,6 +782,9 @@ def main() -> int:
     recorder_stall_threshold_seconds = int(config.get("recorder_stall_threshold_seconds", max(8, clip_segment_seconds * 6)))
     clip_stall_threshold_seconds = int(config.get("clip_stall_threshold_seconds", 90))
     clip_poll_error_threshold = int(config.get("clip_poll_error_threshold", 5))
+
+    # publisher_mode: "docker" (default) or "process" (bare metal whip-client)
+    publisher_mode = config.get("publisher_mode", "docker")
 
     # go2rtc mode: enabled when rtsp_main_url is present in config
     use_go2rtc = bool(config.get("rtsp_main_url"))
@@ -711,6 +831,8 @@ def main() -> int:
     def _cleanup() -> None:
         stop_process(recorder_process, "segment_recorder")
         stop_process(cv_process, "cv_runtime")
+        if publisher_mode == "process":
+            stop_whip_process()
     atexit.register(_cleanup)
 
     game_config_cache: dict | None = None
@@ -723,12 +845,19 @@ def main() -> int:
         except Exception:
             pass
 
+    # Refresh auth token on startup
+    if device_secret:
+        new_token = refresh_auth_token(base_url, node_slug, device_secret, config_path, ssl_verify)
+        if new_token:
+            auth_token = new_token
+            last_token_refresh = time.time()
+
     if use_go2rtc:
         log(f"go2rtc mode enabled: main={config.get('rtsp_main_url')} sub={rtsp_url} port={go2rtc_port}")
-    log(f"yourmove-edge supervisor started for {node_slug}")
+    log(f"yourmove-edge supervisor started for {node_slug} publisher_mode={publisher_mode}")
 
-    # In go2rtc mode, start the container on first launch
-    if use_go2rtc:
+    # In go2rtc mode with Docker, start the container on first launch
+    if use_go2rtc and publisher_mode == "docker":
         ok, detail = start_go2rtc_container(config, go2rtc_config_dir)
         if ok:
             log(f"go2rtc container started id={detail}")
@@ -736,10 +865,23 @@ def main() -> int:
         else:
             log(f"go2rtc container start failed: {detail}")
 
+    # In process mode, start whip-client on first launch
+    if publisher_mode == "process":
+        whip_source = f"rtsp://127.0.0.1:{go2rtc_port}/sub" if use_go2rtc else rtsp_url
+        ok, detail = start_whip_process(config, whip_source)
+        if ok:
+            log(f"whip-client started {detail}")
+            time.sleep(3)
+        else:
+            log(f"whip-client start failed: {detail}")
+
     if cv_enabled and clip_buffer_enabled:
         cv_process = start_cv_runtime(config_path, cv_log_path)
     while not SHUTDOWN_REQUESTED:
-        running = container_running(container_name)
+        if publisher_mode == "process":
+            running = whip_process_running()
+        else:
+            running = container_running(container_name)
         if clip_buffer_enabled:
             rtsp_ok = True
             rtsp_detail = "probe-skipped"
@@ -787,9 +929,8 @@ def main() -> int:
                 go2rtc_stall_count = 0
 
         # Detect stale WHIP sessions: container running but no new packets sent.
-        # Check rtspsrc bytes-received too — whipsink can keep ticking packets-sent
-        # on keepalives after the RTSP source dies mid-session.
-        if running and rtsp_ok:
+        # (Docker mode only — process mode doesn't have docker log stats)
+        if running and rtsp_ok and publisher_mode == "docker":
             current_packets = whip_packets_sent(container_name)
             if current_packets is not None:
                 if last_whip_packets is not None and current_packets <= last_whip_packets:
@@ -853,7 +994,10 @@ def main() -> int:
             last_rtsp_bytes = None
             rtsp_stall_count = 0
             go2rtc_stall_count = 0
-            if use_go2rtc:
+            if publisher_mode == "process":
+                whip_source = f"rtsp://127.0.0.1:{go2rtc_port}/sub" if use_go2rtc else rtsp_url
+                ok, output = start_whip_process(config, whip_source)
+            elif use_go2rtc:
                 ok, output = start_go2rtc_container(config, go2rtc_config_dir)
             else:
                 ok, output = restart_publisher(restart_command)
@@ -924,28 +1068,19 @@ def main() -> int:
                         if cv_enabled and interaction_id not in game_event_posted_ids:
                             try:
                                 fire_marker_path = state_dir / f"{node_slug}-fire-marker.json"
-                                fire_marker_path.write_text(json.dumps({"interaction_id": interaction_id, "ts": time.time()}))
+                                aim_config = None
+                                if aim_context_cache:
+                                    aim_config = dict(aim_context_cache)
+                                    aim_config["pan"] = job.get("pan")
+                                    aim_config["tilt"] = job.get("tilt")
+                                fire_marker_path.write_text(json.dumps({
+                                    "interaction_id": interaction_id,
+                                    "ts": time.time(),
+                                    "aim_config": aim_config,
+                                }))
                             except Exception:
                                 pass
-                            try:
-                                cv_state_path = state_dir / f"{node_slug}-cv-state.json"
-                                if cv_state_path.exists():
-                                    cv_state = json.loads(cv_state_path.read_text())
-                                    from edge.edge_cv_runtime import evaluate_interaction, post_game_event
-                                    aim_config = None
-                                    if aim_context_cache:
-                                        aim_config = dict(aim_context_cache)
-                                        aim_config["pan"] = job.get("pan")
-                                        aim_config["tilt"] = job.get("tilt")
-                                    game_event = evaluate_interaction(cv_state, game_config_cache, interaction_id, aim_config=aim_config)
-                                    if game_event:
-                                        game_events_path = state_dir / f"{node_slug}-game-events-{interaction_id}.json"
-                                        game_events_path.write_text(json.dumps([game_event]))
-                                        post_game_event(base_url, node_slug, auth_token, game_event, ssl_verify=ssl_verify)
-                                        log(f"game_event interaction={interaction_id} event={game_event.get('event')} score={game_event.get('score', {}).get('final', 0)}")
-                                    game_event_posted_ids.add(interaction_id)
-                            except Exception as exc:
-                                log(f"game_event_failed interaction={interaction_id} error={exc}")
+                            game_event_posted_ids.add(interaction_id)
                         if time.time() < fired_at_ts + current_trigger_offset_seconds + current_post_roll_seconds + max(10, clip_segment_seconds * 3):
                             continue
                         output_path = state_dir / f"{node_slug}-clip-{interaction_id}.mp4"
@@ -1062,11 +1197,12 @@ def main() -> int:
         elif clip_jobs_error_count >= clip_poll_error_threshold and clip_jobs_error:
             degraded_reason = f"clip job polling failing ({clip_jobs_error_count} consecutive errors)"
         if auth_token:
-            post_edge_heartbeat(
+            hb_ok, hb_data = post_edge_heartbeat(
                 base_url,
                 node_slug,
                 auth_token,
                 {
+                    "firmware_version": firmware_version,
                     "health": health,
                     "rtsp_ok": rtsp_ok,
                     "rtsp_detail": rtsp_detail,
@@ -1087,16 +1223,47 @@ def main() -> int:
                     "rtsp_bytes_received": last_rtsp_bytes,
                     "rtsp_stall_count": rtsp_stall_count,
                     "segment_age_seconds": newest_segment_age_seconds(clip_segment_dir),
+                    "publisher_mode": publisher_mode,
                 },
                 probe_timeout,
                 ssl_verify,
             )
+            if hb_ok and hb_data.get("pending_update"):
+                flag = Path("/tmp/yourmove-update-requested")
+                if not flag.exists():
+                    flag.touch()
+                    log("update_requested — wrote flag file")
+            if hb_ok and publisher_mode == "process":
+                new_rtmp_url = hb_data.get("rtmp_url", "")
+                new_rtmp_key = hb_data.get("rtmp_key", "")
+                if new_rtmp_url and new_rtmp_key and (new_rtmp_url != config.get("rtmp_url") or new_rtmp_key != config.get("rtmp_key")):
+                    log(f"publish credentials updated from heartbeat")
+                    config["rtmp_url"] = new_rtmp_url
+                    config["rtmp_key"] = new_rtmp_key
+                    try:
+                        with open(config_path, "w") as f:
+                            json.dump(config, f, indent=2)
+                    except Exception:
+                        pass
+                    pub_source = f"rtsp://127.0.0.1:{go2rtc_port}/sub" if use_go2rtc else rtsp_url
+                    ok, detail = start_publisher_process(config, pub_source)
+                    if ok:
+                        log(f"publisher restarted with new credentials {detail}")
+                        consecutive_publish_failures = 0
+                        last_restart_at = time.time()
+
+        # Periodic token refresh
+        if device_secret and (time.time() - last_token_refresh) > TOKEN_REFRESH_INTERVAL:
+            new_token = refresh_auth_token(base_url, node_slug, device_secret, config_path, ssl_verify)
+            if new_token:
+                auth_token = new_token
+            last_token_refresh = time.time()
 
         if cv_enabled and cv_process is not None and cv_process.poll() is not None:
             log(f"cv_runtime_exited code={cv_process.returncode}")
             cv_process = start_cv_runtime(config_path, cv_log_path)
 
-        time.sleep(probe_interval)
+        time.sleep(min(2, probe_interval))
 
     stop_process(recorder_process, "segment_recorder")
     stop_process(cv_process, "cv_runtime")

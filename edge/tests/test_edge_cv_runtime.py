@@ -204,20 +204,33 @@ class TestEmbeddingDedup:
     def test_extract_crops_uses_embedding_cache(self):
         """Verify that extract_and_upload_crops sends embedding instead of phash."""
         from edge.edge_cv_runtime import extract_and_upload_crops
-        import numpy as np
         from unittest.mock import patch, MagicMock
         from pathlib import Path
         import tempfile
 
-        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        class DummyFrame:
+            shape = (480, 640, 3)
+
+            def __getitem__(self, _key):
+                return self
+
+        frame = DummyFrame()
         detections = [
             {"class": "bird", "confidence": 0.9, "bbox": [100, 100, 300, 300]},
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("edge.edge_cv_runtime.requests.post") as mock_post:
+            with patch("edge.edge_cv_runtime.requests.post") as mock_post, \
+                 patch("edge.edge_cv_runtime.compute_embedding", return_value=[0.1, 0.2, 0.3]), \
+                 patch("edge.edge_cv_runtime.embedding_to_b64", return_value="encoded-embedding"), \
+                 patch("edge.edge_cv_runtime._get_embedding_cache") as mock_cache_factory, \
+                 patch("cv2.resize", side_effect=lambda img, _size: img), \
+                 patch("cv2.imencode", return_value=(True, MagicMock(tobytes=lambda: b"jpeg-bytes"))):
                 mock_resp = MagicMock()
                 mock_resp.status_code = 200
                 mock_post.return_value = mock_resp
+                mock_cache = MagicMock()
+                mock_cache.is_duplicate.return_value = False
+                mock_cache_factory.return_value = mock_cache
 
                 extract_and_upload_crops(
                     frame, detections, "test-node",
@@ -233,3 +246,86 @@ class TestEmbeddingDedup:
                     assert len(crops) > 0
                     assert "embedding" in crops[0]
                     assert "phash" not in crops[0]
+
+
+def test_evaluate_interaction_prefers_shot_probe_hit():
+    from edge.edge_cv_runtime import evaluate_interaction
+
+    game_config = {
+        "template_type": "blast",
+        "template_config": {
+            "type": "blast",
+            "scoring": {
+                "hit_base_points": 75,
+                "miss_points": 5,
+                "target_points": {"chicken": 100, "cat": -50},
+                "allow_negative": True,
+            },
+        },
+        "cv_settings": {},
+    }
+    detection_state = {
+        "targets": [],
+        "all_detections": [],
+        "frame_size": [360, 640],
+        "source_resolution": [360, 640],
+        "tier": 1,
+        "blocked": False,
+        "shot_probe": {
+            "label": "chicken",
+            "confidence": 0.93,
+            "crop_box": [200, 120, 320, 240],
+            "points": 100,
+            "kind": "positive",
+            "accepted": True,
+        },
+    }
+
+    result = evaluate_interaction(detection_state, game_config, interaction_id=42, aim_config=None)
+
+    assert result is not None
+    assert result["event"] == "hit"
+    assert result["target"]["name"] == "chicken"
+    assert result["score"]["final"] == 100
+    assert result["detection"]["source"] == "shot_classifier"
+
+
+def test_evaluate_interaction_prefers_shot_probe_miss():
+    from edge.edge_cv_runtime import evaluate_interaction
+
+    game_config = {
+        "template_type": "blast",
+        "template_config": {
+            "type": "blast",
+            "scoring": {
+                "hit_base_points": 75,
+                "miss_points": 5,
+                "target_points": {"chicken": 100},
+                "allow_negative": False,
+            },
+        },
+        "cv_settings": {},
+    }
+    detection_state = {
+        "targets": [],
+        "all_detections": [],
+        "frame_size": [360, 640],
+        "source_resolution": [360, 640],
+        "tier": 1,
+        "blocked": False,
+        "shot_probe": {
+            "label": "background",
+            "confidence": 0.88,
+            "crop_box": [180, 100, 300, 220],
+            "points": 5,
+            "kind": "none",
+            "accepted": True,
+        },
+    }
+
+    result = evaluate_interaction(detection_state, game_config, interaction_id=43, aim_config=None)
+
+    assert result is not None
+    assert result["event"] == "miss"
+    assert result["score"]["final"] == 5
+    assert result["detection"]["source"] == "shot_classifier"

@@ -1,0 +1,5 @@
+paho-mqtt>=1.6,<2
+flask>=3.0
+requests>=2.28
+gpiozero>=2.0
+cryptography>=42.0

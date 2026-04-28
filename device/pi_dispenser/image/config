@@ -1,0 +1,10 @@
+IMG_NAME=yourmove-dispenser
+RELEASE=trixie
+TARGET_HOSTNAME=yourmove-dispenser
+FIRST_USER_NAME=pi
+FIRST_USER_PASS=yourmove
+ENABLE_SSH=1
+LOCALE_DEFAULT=en_US.UTF-8
+KEYBOARD_KEYMAP=us
+TIMEZONE_DEFAULT=America/Chicago
+STAGE_LIST="stage0 stage1 stage2 stage-yourmove"

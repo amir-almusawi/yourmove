@@ -1,0 +1,15 @@
+[Unit]
+Description=YourMove Reset Button Monitor
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m device.pi_dispenser.button
+WorkingDirectory=/opt/yourmove
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

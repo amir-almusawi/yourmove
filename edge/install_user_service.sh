@@ -15,7 +15,8 @@ if systemctl --user list-unit-files "$LEGACY_UNIT" --no-legend 2>/dev/null | gre
     rm -f "$UNIT_DIR/$LEGACY_UNIT"
 fi
 
-install -m 0644 "/home/amir/websites/yourmove/edge/systemd/yourmove-edge@.service" "$UNIT_DIR/yourmove-edge@.service"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+install -m 0644 "$SCRIPT_DIR/systemd/yourmove-edge@.service" "$UNIT_DIR/yourmove-edge@.service"
 systemctl --user daemon-reload
 systemctl --user enable --now "yourmove-edge@${INSTANCE}.service"
 systemctl --user restart "yourmove-edge@${INSTANCE}.service"

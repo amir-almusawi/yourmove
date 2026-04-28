@@ -1,0 +1,15 @@
+[Unit]
+Description=YourMove go2rtc RTSP Relay
+After=yourmove-orchestrator.service
+ConditionPathExists=/etc/yourmove/go2rtc.yaml
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/go2rtc -config /etc/yourmove/go2rtc.yaml
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -20,3 +20,4 @@ state/
 
 # Optional local model weights
 *.pt
+device/pi_dispenser/image/pi-gen/

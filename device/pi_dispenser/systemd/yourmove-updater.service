@@ -1,0 +1,7 @@
+[Unit]
+Description=YourMove OTA Updater
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/yourmove/device/pi_dispenser/updater.sh

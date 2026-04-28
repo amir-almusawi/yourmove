@@ -101,6 +101,27 @@ def build_overlay_events(game_events: list[dict], clip_start_ms: int) -> list[di
     return overlay_events
 
 
+def _build_world_prompts(labels: list[str], descriptions: dict) -> tuple[list[str], list[str]]:
+    """Build CLIP text prompts for YOLO-World from labels + descriptions.
+    Comma-separated descriptions expand into multiple prompts for the same label.
+    Returns (class_names, prompts) — both lists are the same length, with
+    class_names containing the label each prompt maps back to."""
+    class_names = []
+    prompts = []
+    for label in labels:
+        desc_entry = descriptions.get(label, {})
+        desc = (desc_entry.get("description") or "").strip() if isinstance(desc_entry, dict) else ""
+        if desc and desc != label:
+            parts = [p.strip() for p in desc.split(",") if p.strip()]
+            for part in parts:
+                class_names.append(label)
+                prompts.append(part)
+        else:
+            class_names.append(label)
+            prompts.append(label)
+    return class_names, prompts
+
+
 def filter_detections(
     detections: list[dict],
     cv_settings: dict,
@@ -108,7 +129,7 @@ def filter_detections(
     has_classifier: bool = False,
 ) -> list[dict]:
     """Apply exclusion pipeline: confidence threshold, exclusion zones, and optionally YOLO class ignore list."""
-    threshold = cv_settings.get("cv_confidence_threshold", 30) / 100.0
+    threshold = cv_settings.get("cv_confidence_threshold", 25) / 100.0
     exclusion_zones = cv_settings.get("cv_exclusion_zones", [])
     fh, fw = frame_shape
 
@@ -202,6 +223,38 @@ def classify_crop(crop_img):
     return class_name, confidence.item()
 
 
+def _download_model_if_needed(
+    *,
+    base_url: str,
+    node_slug: str,
+    auth_token: str,
+    model_key: str,
+    cache_path: Path,
+    key_path: Path,
+    ssl_verify: bool,
+    timeout: int = 30,
+) -> bool:
+    cached_key = key_path.read_text().strip() if key_path.exists() else ""
+    if cache_path.exists() and cached_key == model_key:
+        return True
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        resp = requests.get(
+            f"{base_url.rstrip('/')}/api/nodes/{node_slug}/cv-model",
+            params={"key": model_key},
+            headers={"Authorization": f"Bearer {auth_token}"},
+            timeout=timeout,
+            verify=ssl_verify,
+        )
+        resp.raise_for_status()
+        cache_path.write_bytes(resp.content)
+        key_path.write_text(model_key)
+        return True
+    except Exception as exc:
+        log.warning("Failed to download model %s: %s", model_key, exc)
+        return cache_path.exists()
+
+
 _track_labels: dict[int, tuple[str, float]] = {}
 _track_bboxes: dict[int, list[int]] = {}
 _rtsp_source = None
@@ -242,6 +295,15 @@ def run_detection_loop(
     cv_settings = game_config.get("cv_settings", {})
     yolo_conf = cv_settings.get("cv_confidence_threshold", 25) / 100.0
     detections = run_tracking(frame, model_name=model_name, conf=max(0.05, yolo_conf))
+    raw_detection_count = len(detections)
+
+    from edge.edge_cv_detect import get_custom_yolo_classes as _get_cyc
+    _cyc = _get_cyc()
+    if _cyc:
+        existing_allowed = cv_settings.get("cv_allowed_classes") or []
+        if existing_allowed:
+            cv_settings = {**cv_settings, "cv_allowed_classes": list(set(existing_allowed) | set(_cyc))}
+
     detections = filter_detections(detections, cv_settings, frame.shape[:2], has_classifier=_classifier_model is not None)
 
     from edge.edge_cv_detect import get_custom_yolo_classes
@@ -334,6 +396,7 @@ def run_detection_loop(
         "lost_track_crops": lost_track_crops if _classifier_model is not None else [],
         "blocked": blocked,
         "frame_shape": frame.shape[:2],
+        "raw_detection_count": raw_detection_count,
         "detection_count": len(detections),
         "timestamp_ms": int(time.time() * 1000),
         "frame": frame,
@@ -354,6 +417,9 @@ def evaluate_interaction(
     scoring_config = template_config.get("scoring", {})
     template_type = template_config.get("type", game_config.get("template_type", "blast"))
     targets = detection_state.get("targets", [])
+    if not targets:
+        targets = [d for d in detection_state.get("all_detections", [])
+                   if d.get("classifier_label") and d["classifier_label"] != "__ignore__"]
 
     if detection_state.get("blocked"):
         return {
@@ -368,6 +434,8 @@ def evaluate_interaction(
 
     hit_base = scoring_config.get("hit_base_points", 75)
     miss_points = scoring_config.get("miss_points", 5)
+
+    shot_probe = detection_state.get("shot_probe")
 
     if aim_config and ("pan" in aim_config):
         from edge.edge_cv_score import pan_tilt_to_crosshair
@@ -386,13 +454,43 @@ def evaluate_interaction(
         frame_size = (640, 480)
 
     target_points = scoring_config.get("target_points")
+    cv_settings = game_config.get("cv_settings", {})
+    scoring_mode = cv_settings.get("cv_scoring_mode", "gradient")
+    padding_pct = float(cv_settings.get("cv_target_padding_pct", 0))
 
     from edge.edge_cv_score import score_targets_by_accuracy, compute_score
-    result = score_targets_by_accuracy(
-        targets, crosshair, frame_size,
-        hit_base=hit_base, miss_points=miss_points,
-        target_points=target_points,
-    )
+    if shot_probe and shot_probe.get("accepted"):
+        if shot_probe.get("kind") == "none":
+            result = {
+                "event": "miss",
+                "reaction": "miss",
+                "target": {},
+                "score": {"base": miss_points, "multipliers": {}, "final": miss_points},
+                "accuracy": float(shot_probe.get("confidence", 0.0)),
+                "bbox": shot_probe.get("crop_box"),
+                "source": "shot_classifier",
+            }
+        else:
+            probe_points = int(shot_probe.get("points", 0))
+            result = {
+                "event": "hit",
+                "reaction": "hit",
+                "target": {
+                    "name": shot_probe.get("label", ""),
+                    "confidence": shot_probe.get("confidence", 0),
+                },
+                "score": {"base": probe_points, "multipliers": {}, "final": probe_points},
+                "accuracy": float(shot_probe.get("confidence", 0.0)),
+                "bbox": shot_probe.get("crop_box"),
+                "source": "shot_classifier",
+            }
+    else:
+        result = score_targets_by_accuracy(
+            targets, crosshair, frame_size,
+            hit_base=hit_base, miss_points=miss_points,
+            target_points=target_points,
+            scoring_mode=scoring_mode, padding_pct=padding_pct,
+        )
 
     final_score = compute_score(
         result["score"]["final"], scoring_config, {},
@@ -408,6 +506,7 @@ def evaluate_interaction(
         "detection": {
             "tier": detection_state.get("tier", 1),
             "bbox": result.get("bbox"),
+            "source": result.get("source", "live_detection"),
         },
         "accuracy": round(result.get("accuracy", 0.0), 3),
         "timestamp_ms": int(time.time() * 1000),
@@ -469,11 +568,20 @@ def extract_and_upload_crops(
     class_confidence_overrides: dict | None = None,
     locked_classes: set | None = None,
     frames_dir: Path | None = None,
-) -> None:
-    """Crop detected objects from the frame and upload to the platform."""
+) -> dict:
+    """Crop detected objects from the frame and upload to the platform.
+    Returns a dict of capture statistics for debug display."""
     import cv2
     crops_payload = []
     frame_id = None
+    stats = {
+        "detections_total": len(detections),
+        "crops_captured": 0,
+        "skipped_too_small": 0,
+        "skipped_locked": 0,
+        "skipped_duplicate": 0,
+        "details": [],
+    }
 
     for i, det in enumerate(detections):
         bbox = det["bbox"]
@@ -481,8 +589,17 @@ def extract_and_upload_crops(
         y1 = max(0, bbox[1])
         x2 = min(frame.shape[1], bbox[2])
         y2 = min(frame.shape[0], bbox[3])
-        if x2 - x1 < min_crop_size or y2 - y1 < min_crop_size:
-            log.debug("SKIP: too small %dx%d (min=%d)", x2 - x1, y2 - y1, min_crop_size)
+        crop_w, crop_h = x2 - x1, y2 - y1
+        det_detail = {
+            "class": det.get("classifier_label") or det["class"],
+            "conf": round(det["confidence"], 2),
+            "size": min(crop_w, crop_h),
+        }
+        if crop_w < min_crop_size or crop_h < min_crop_size:
+            log.debug("SKIP: too small %dx%d (min=%d)", crop_w, crop_h, min_crop_size)
+            stats["skipped_too_small"] += 1
+            det_detail["skip"] = "small"
+            stats["details"].append(det_detail)
             continue
         crop_img = frame[y1:y2, x1:x2]
         resized = cv2.resize(crop_img, (224, 224))
@@ -491,13 +608,20 @@ def extract_and_upload_crops(
         cls_conf = det.get("classifier_confidence", 0)
         if locked_classes and cls_label in locked_classes and cls_conf >= classifier_confidence:
             log.debug("SKIP: locked %s", cls_label)
+            stats["skipped_locked"] += 1
+            det_detail["skip"] = "locked"
+            stats["details"].append(det_detail)
             continue
 
         emb = compute_embedding(resized)
         cache = _get_embedding_cache(node_slug)
         if cache.is_duplicate(emb):
             log.debug("SKIP: embedding dup (cosine > %.2f)", EMBEDDING_DEDUP_THRESHOLD)
+            stats["skipped_duplicate"] += 1
+            det_detail["skip"] = "dup"
+            stats["details"].append(det_detail)
             continue
+        stats["details"].append(det_detail)
         cache.register(emb)
         emb_b64 = embedding_to_b64(emb)
         _, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 75])
@@ -555,6 +679,7 @@ def extract_and_upload_crops(
             crop_entry["frame_id"] = frame_id
         crops_payload.append(crop_entry)
 
+    stats["crops_captured"] = len(crops_payload)
     log.debug("extract_crops: %d dets in, %d crops out (source=%s)", len(detections), len(crops_payload), source)
     if crops_payload:
         try:
@@ -568,6 +693,95 @@ def extract_and_upload_crops(
             log.info("Crop upload: %d crops, status=%d", len(crops_payload), resp.status_code)
         except Exception as exc:
             log.warning("Crop upload failed: %s", exc)
+    return stats
+
+
+def extract_and_upload_shot_crops(
+    frame,
+    crosshair: tuple[float, float],
+    node_slug: str,
+    base_url: str,
+    auth_token: str,
+    crops_dir: Path,
+    interaction_id: int | None = None,
+    ssl_verify: bool = True,
+    cv_settings: dict | None = None,
+) -> dict:
+    """Capture crosshair-centered shot crops for manual review and shot-model training."""
+    import cv2
+
+    cv_settings = cv_settings or {}
+    from edge.edge_cv_shot import build_crosshair_crops, classify_crop, shot_classifier_loaded
+
+    crops_payload = []
+    stats = {"shot_crops_captured": 0}
+    for i, crop in enumerate(build_crosshair_crops(frame, crosshair, cv_settings)):
+        crop_img = crop["crop_img"]
+        model_img = crop["model_img"]
+        if crop_img.size == 0:
+            continue
+        resized = cv2.resize(crop_img, (224, 224))
+        _, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        crop_bytes = buf.tobytes()
+
+        predicted_label = ""
+        predicted_confidence = 0.0
+        if shot_classifier_loaded():
+            try:
+                predicted_label, predicted_confidence = classify_crop(model_img)
+            except Exception:
+                predicted_label, predicted_confidence = "", 0.0
+
+        ts = int(time.time() * 1000)
+        crop_id = f"{ts}_shot_{interaction_id or 'none'}_{i}"
+        storage_key = f"crops/{node_slug}/{crop_id}.jpg"
+        local_path = crops_dir / f"{crop_id}.jpg"
+        try:
+            local_path.write_bytes(crop_bytes)
+        except OSError as exc:
+            log.warning("Failed to save shot crop locally at %s: %s", local_path, exc)
+            continue
+
+        thumb = cv2.resize(resized, (80, 80))
+        _, thumb_buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        thumb_bytes = thumb_buf.tobytes()
+        try:
+            requests.post(
+                f"{base_url.rstrip('/')}/api/nodes/{node_slug}/operator/cv-crop-image?crop_id={crop_id}&thumbnail=1",
+                headers={"Authorization": f"Bearer {auth_token}", "Content-Type": "image/jpeg"},
+                data=thumb_bytes,
+                timeout=5,
+                verify=ssl_verify,
+            )
+        except Exception as exc:
+            log.warning("Thumbnail upload failed for shot crop %s: %s", crop_id, exc)
+
+        crops_payload.append({
+            "storage_key": storage_key,
+            "yolo_class": "__shot__",
+            "confidence": float(predicted_confidence or 0.0),
+            "bbox": crop["crop_box"],
+            "frame_shape": list(frame.shape[:2]),
+            "source": "shot",
+            "interaction_id": interaction_id,
+            "predicted_label": predicted_label or "",
+            "predicted_confidence": float(predicted_confidence or 0.0),
+        })
+
+    stats["shot_crops_captured"] = len(crops_payload)
+    if crops_payload:
+        try:
+            resp = requests.post(
+                f"{base_url.rstrip('/')}/api/nodes/{node_slug}/operator/cv-crops",
+                headers={"Authorization": f"Bearer {auth_token}"},
+                json={"crops": crops_payload},
+                timeout=5,
+                verify=ssl_verify,
+            )
+            log.info("Shot crop upload: %d crops, status=%d", len(crops_payload), resp.status_code)
+        except Exception as exc:
+            log.warning("Shot crop upload failed: %s", exc)
+    return stats
 
 
 def main() -> int:
@@ -643,29 +857,44 @@ def main() -> int:
     if active_model_key:
         model_cache_path = Path(f"/tmp/cv-models/{node_slug}/classifier.pth")
         model_key_path = Path(f"/tmp/cv-models/{node_slug}/classifier.key")
-        cached_key = model_key_path.read_text().strip() if model_key_path.exists() else ""
-        if not model_cache_path.exists() or cached_key != active_model_key:
-            model_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                resp = requests.get(
-                    f"{base_url.rstrip('/')}/api/nodes/{node_slug}/cv-model",
-                    params={"key": active_model_key},
-                    headers={"Authorization": f"Bearer {auth_token}"},
-                    timeout=30,
-                    verify=ssl_verify,
-                )
-                resp.raise_for_status()
-                model_cache_path.write_bytes(resp.content)
-                model_key_path.write_text(active_model_key)
-                log.info("Downloaded classifier model: %s", active_model_key)
-            except Exception as e:
-                log.warning("Failed to download classifier model: %s", e)
+        if _download_model_if_needed(
+            base_url=base_url,
+            node_slug=node_slug,
+            auth_token=auth_token,
+            model_key=active_model_key,
+            cache_path=model_cache_path,
+            key_path=model_key_path,
+            ssl_verify=ssl_verify,
+        ):
+            log.info("Classifier model ready: %s", active_model_key)
         if model_cache_path.exists():
             try:
                 class_names = load_classifier(model_cache_path)
                 log.info("Loaded classifier: classes=%s", class_names)
             except Exception as e:
                 log.warning("Failed to load classifier: %s", e)
+
+    active_shot_model_key = cv_settings_init.get("active_shot_model_key")
+    if active_shot_model_key:
+        shot_cache_path = Path(f"/tmp/cv-models/{node_slug}/shot-classifier.pth")
+        shot_key_path = Path(f"/tmp/cv-models/{node_slug}/shot-classifier.key")
+        if _download_model_if_needed(
+            base_url=base_url,
+            node_slug=node_slug,
+            auth_token=auth_token,
+            model_key=active_shot_model_key,
+            cache_path=shot_cache_path,
+            key_path=shot_key_path,
+            ssl_verify=ssl_verify,
+        ):
+            log.info("Shot classifier model ready: %s", active_shot_model_key)
+        if shot_cache_path.exists():
+            try:
+                from edge.edge_cv_shot import load_shot_classifier
+                shot_classes = load_shot_classifier(shot_cache_path)
+                log.info("Loaded shot classifier: classes=%s", shot_classes)
+            except Exception as e:
+                log.warning("Failed to load shot classifier: %s", e)
 
     log.info("Frames dir: %s (%d existing)", frames_dir, len(list(frames_dir.glob("*.jpg"))))
 
@@ -701,16 +930,20 @@ def main() -> int:
     else:
         custom_labels = cv_settings_init.get("cv_custom_labels", [])
         if custom_labels:
+            label_descriptions = cv_settings_init.get("cv_label_descriptions", {})
+            world_class_names, world_prompts = _build_world_prompts(custom_labels, label_descriptions)
             world_path = Path(f"/tmp/cv-models/{node_slug}/yolo-world.pt")
             world_labels_path = Path(f"/tmp/cv-models/{node_slug}/yolo-world-labels.txt")
             cached_labels = world_labels_path.read_text().strip() if world_labels_path.exists() else ""
-            labels_key = ",".join(sorted(custom_labels))
+            labels_key = ",".join(sorted(world_prompts))
             if not world_path.exists() or cached_labels != labels_key:
                 world_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     from edge.edge_cv_detect import generate_world_model
-                    log.info("Generating YOLO-World model for labels: %s", custom_labels)
-                    generate_world_model(custom_labels, str(world_path))
+                    log.info("Generating YOLO-World model for labels: %s prompts: %s", world_class_names, world_prompts)
+                    has_descriptions = world_prompts != world_class_names
+                    generate_world_model(world_class_names, str(world_path),
+                                         prompts=world_prompts if has_descriptions else None)
                     world_labels_path.write_text(labels_key)
                 except Exception as e:
                     log.warning("Failed to generate YOLO-World model: %s", e)
@@ -730,6 +963,16 @@ def main() -> int:
     cv_state_path = state_dir / f"{node_slug}-cv-state.json"
     last_config_refresh = time.time()
 
+    _annotated_label_colors: dict[str, str] = (game_config.get("cv_settings") or {}).get("cv_label_colors") or {}
+    _annotated_publisher = None
+    _annotated_publisher_started = False
+    try:
+        from edge.edge_cv_annotate import draw_detections, AnnotatedStreamPublisher
+    except ImportError:
+        draw_detections = None
+        AnnotatedStreamPublisher = None
+        log.warning("edge_cv_annotate not available — annotated frames disabled")
+
     training_process = None
     training_job_id = None
     failed_training_job_id = None
@@ -741,7 +984,23 @@ def main() -> int:
     post_ready = threading.Event()
     post_ready.set()
     last_snapshot_post = 0.0
+    _pending_fires: list[dict] = []
+    _pending_fires_lock = threading.Lock()
     last_crop_capture = 0.0
+
+    _crop_thread_busy = threading.Event()
+    _crop_result: dict | None = None
+    _crop_result_lock = threading.Lock()
+
+    def _crop_worker(frame, detections, kwargs):
+        nonlocal _crop_result
+        try:
+            stats = extract_and_upload_crops(frame=frame, detections=detections, **kwargs)
+        except Exception:
+            stats = {}
+        with _crop_result_lock:
+            _crop_result = stats
+        _crop_thread_busy.clear()
 
     def _post_thread():
         """Drains post_queue, sends CV state to server. Runs until SHUTDOWN."""
@@ -754,16 +1013,36 @@ def main() -> int:
             payload = post_queue.pop()
             post_queue.clear()
             post_ready.clear()
+            annotated_jpeg = payload.pop("_annotated_jpeg", None)
             try:
-                requests.post(
+                resp = requests.post(
                     f"{base_url.rstrip('/')}/api/nodes/{node_slug}/operator/cv-state",
                     headers={"Authorization": f"Bearer {auth_token}"},
                     json=payload,
                     timeout=3,
                     verify=ssl_verify,
                 )
+                if resp.ok:
+                    fires = resp.json().get("pending_fires") or []
+                    if fires:
+                        with _pending_fires_lock:
+                            existing_ids = {f["interaction_id"] for f in _pending_fires}
+                            for f in fires:
+                                if f["interaction_id"] not in existing_ids:
+                                    _pending_fires.append(f)
             except Exception:
                 pass
+            if annotated_jpeg:
+                try:
+                    requests.post(
+                        f"{base_url.rstrip('/')}/api/nodes/{node_slug}/operator/cv-frame",
+                        headers={"Authorization": f"Bearer {auth_token}", "Content-Type": "image/jpeg"},
+                        data=annotated_jpeg,
+                        timeout=2,
+                        verify=ssl_verify,
+                    )
+                except Exception:
+                    pass
             now = time.time()
             if now - last_snapshot_post >= 10.0:
                 try:
@@ -786,12 +1065,17 @@ def main() -> int:
     poster = threading.Thread(target=_post_thread, daemon=True)
     poster.start()
 
+    _target_fps = int(config.get("annotated_stream_fps", 25))
+    _frame_interval = 1.0 / _target_fps
+    _loop_start = time.time()
+
     while not SHUTDOWN:
         now_loop = time.time()
         if now_loop - last_config_refresh >= 30.0:
             refreshed = fetch_game_config(base_url, node_slug, auth_token, ssl_verify=ssl_verify)
             if refreshed:
                 game_config = refreshed
+                _annotated_label_colors = (refreshed.get("cv_settings") or {}).get("cv_label_colors") or {}
                 wanted_url = cv_rtsp_main if refreshed.get("cv_settings", {}).get("cv_use_main_stream") else cv_rtsp_sub
                 if wanted_url != cv_rtsp_url:
                     log.info("Switching CV stream: %s", wanted_url)
@@ -801,27 +1085,69 @@ def main() -> int:
                         _rtsp_source = None
                 from edge.edge_cv_detect import get_custom_yolo_source
                 if get_custom_yolo_source() != "finetuned":
-                    new_labels = refreshed.get("cv_settings", {}).get("cv_custom_labels", [])
+                    new_cv = refreshed.get("cv_settings", {})
+                    new_labels = new_cv.get("cv_custom_labels", [])
+                    new_descriptions = new_cv.get("cv_label_descriptions", {})
+                    new_class_names, new_prompts = _build_world_prompts(new_labels, new_descriptions)
                     world_labels_path = Path(f"/tmp/cv-models/{node_slug}/yolo-world-labels.txt")
                     cached_labels = world_labels_path.read_text().strip() if world_labels_path.exists() else ""
-                    labels_key = ",".join(sorted(new_labels)) if new_labels else ""
+                    labels_key = ",".join(sorted(new_prompts)) if new_prompts else ""
                     if labels_key and labels_key != cached_labels:
                         world_path = Path(f"/tmp/cv-models/{node_slug}/yolo-world.pt")
                         world_path.parent.mkdir(parents=True, exist_ok=True)
                         try:
                             from edge.edge_cv_detect import generate_world_model
-                            log.info("Labels changed, regenerating YOLO-World: %s", new_labels)
-                            generate_world_model(new_labels, str(world_path))
+                            has_descriptions = new_prompts != new_class_names
+                            log.info("Labels changed, regenerating YOLO-World: %s prompts: %s", new_class_names, new_prompts)
+                            generate_world_model(new_class_names, str(world_path),
+                                                 prompts=new_prompts if has_descriptions else None)
                             world_labels_path.write_text(labels_key)
                             _custom_yolo_active = True
                         except Exception as e:
                             log.warning("Failed to regenerate YOLO-World: %s", e)
+                shot_model_key = refreshed.get("cv_settings", {}).get("active_shot_model_key")
+                if shot_model_key:
+                    shot_cache_path = Path(f"/tmp/cv-models/{node_slug}/shot-classifier.pth")
+                    shot_key_path = Path(f"/tmp/cv-models/{node_slug}/shot-classifier.key")
+                    if _download_model_if_needed(
+                        base_url=base_url,
+                        node_slug=node_slug,
+                        auth_token=auth_token,
+                        model_key=shot_model_key,
+                        cache_path=shot_cache_path,
+                        key_path=shot_key_path,
+                        ssl_verify=ssl_verify,
+                    ) and shot_cache_path.exists():
+                        try:
+                            from edge.edge_cv_shot import load_shot_classifier
+                            shot_classes = load_shot_classifier(shot_cache_path)
+                            log.info("Shot classifier refreshed: classes=%s", shot_classes)
+                        except Exception as e:
+                            log.warning("Failed to refresh shot classifier: %s", e)
+                else:
+                    try:
+                        from edge.edge_cv_shot import unload_shot_classifier
+                        unload_shot_classifier()
+                    except Exception:
+                        pass
             last_config_refresh = now_loop
 
         detection_state = run_detection_loop(segment_dir, game_config, tier, rtsp_url=cv_rtsp_url)
         if not detection_state:
             time.sleep(0.1)
             continue
+
+        if not _annotated_publisher_started and AnnotatedStreamPublisher and config.get("annotated_rtsp_port"):
+            _annotated_publisher = AnnotatedStreamPublisher(
+                width=sub_width, height=sub_height,
+                fps=int(config.get("annotated_stream_fps", 25)),
+                rtsp_port=int(config.get("annotated_rtsp_port", 18555)),
+            )
+            if _annotated_publisher.start():
+                log.info("Annotated stream available at %s", _annotated_publisher.rtsp_url)
+            else:
+                _annotated_publisher = None
+            _annotated_publisher_started = True
 
         frame_shape = detection_state.get("frame_shape", (360, 640))
 
@@ -836,6 +1162,20 @@ def main() -> int:
         def _det_points(d):
             lbl = d.get("classifier_label") or d.get("class", "")
             return int(_tp.get(lbl, _hb))
+
+        # Default capture_stats — updated below if crops are actually extracted
+        capture_stats = {
+            "is_capturing": False,
+            "quota_used": 0,
+            "quota_remaining": 0,
+            "detections_in_frame": detection_state.get("raw_detection_count", 0),
+            "detections_after_filter": detection_state.get("detection_count", 0),
+            "crops_captured": 0,
+            "skipped_too_small": 0,
+            "skipped_locked": 0,
+            "skipped_duplicate": 0,
+            "detections_total": 0,
+        }
 
         serializable = {
             "targets": [
@@ -875,17 +1215,10 @@ def main() -> int:
             "yolo_training_frames": len(list(frames_dir.glob("*.jpg"))),
             "custom_yolo_active": _custom_yolo_active,
             "custom_yolo_source": get_custom_yolo_source(),
+            "shot_classifier_active": bool((game_config.get("cv_settings") or {}).get("active_shot_model_key")),
         }
-        try:
-            cv_state_path.write_text(json.dumps(serializable))
-        except Exception:
-            pass
-
-        # Backpressure: enqueue for POST thread, detect next frame immediately
-        if len(post_queue) < _BACKPRESSURE_SLOTS:
-            post_queue.append(serializable)
-            post_ready.set()
-        # else: queue full, server is behind — skip this post, keep detecting
+        # Annotated stream publisher disabled — using browser canvas overlay instead
+        # for zero-latency video with detection boxes sent via cv-state API.
 
         now = time.time()
         cv_settings = (game_config or {}).get("cv_settings", {})
@@ -900,18 +1233,106 @@ def main() -> int:
 
         locked_classes = set(cv_settings.get("cv_locked_classes", []))
         quota_remaining = cv_settings.get("cv_crop_quota_remaining", 500)
+        quota_total = cv_settings.get("cv_crop_quota", 500)
+
+        # Update capture_stats with config-level info
+        capture_stats["is_capturing"] = bool(is_capturing)
+        capture_stats["quota_remaining"] = quota_remaining
+        capture_stats["quota_used"] = max(0, quota_total - quota_remaining)
+
+        def _score_fire(interaction_id, aim_config):
+            shot_probe = None
+            crosshair = None
+            if aim_config and detection_state.get("frame") is not None and cv_settings.get("active_shot_model_key"):
+                try:
+                    from edge.edge_cv_score import pan_tilt_to_crosshair
+                    from edge.edge_cv_shot import classify_crosshair_shot, shot_classifier_loaded
+                    crosshair = pan_tilt_to_crosshair(aim_config)
+                    if shot_classifier_loaded():
+                        shot_probe = classify_crosshair_shot(
+                            detection_state["frame"],
+                            crosshair,
+                            scoring_config=game_config.get("template_config", {}).get("scoring", {}),
+                            cv_settings=(game_config or {}).get("cv_settings", {}),
+                        )
+                except Exception as exc:
+                    log.warning("shot_probe_failed: %s", exc)
+            live_state = {
+                "targets": detection_state.get("targets", []),
+                "all_detections": detection_state.get("all_detections", []),
+                "frame_size": list(detection_state.get("frame_shape", (360, 640))),
+                "source_resolution": list(detection_state.get("frame_shape", (360, 640))),
+                "tier": tier,
+                "blocked": detection_state.get("blocked", False),
+                "shot_probe": shot_probe,
+            }
+            for det in live_state["targets"] + live_state["all_detections"]:
+                if "roster_entry" not in det:
+                    det["roster_entry"] = {"role": "target"}
+            game_event = evaluate_interaction(live_state, game_config, interaction_id, aim_config=aim_config)
+            if game_event:
+                try:
+                    post_game_event(base_url, node_slug, auth_token, game_event, ssl_verify=ssl_verify)
+                    log.info("GAME_EVENT interaction=%s event=%s score=%d",
+                             interaction_id, game_event.get("event"), game_event.get("score", {}).get("final", 0))
+                except Exception as exc:
+                    log.warning("game_event_post_failed: %s", exc)
+            if (
+                aim_config and
+                crosshair is not None and
+                detection_state.get("frame") is not None and
+                cv_settings.get("cv_capture_shot_crops", True)
+            ):
+                threading.Thread(
+                    target=extract_and_upload_shot_crops,
+                    kwargs=dict(
+                        frame=detection_state["frame"].copy(),
+                        crosshair=crosshair,
+                        node_slug=node_slug,
+                        base_url=base_url,
+                        auth_token=auth_token,
+                        crops_dir=crops_dir,
+                        interaction_id=interaction_id,
+                        ssl_verify=ssl_verify,
+                        cv_settings=cv_settings,
+                    ),
+                    daemon=True,
+                ).start()
 
         fire_marker = state_dir / f"{node_slug}-fire-marker.json"
         interaction_crop_source = "idle"
         interaction_id_for_crop = None
+        _scored_interactions: set = getattr(main, "_scored_interactions", set())
+        main._scored_interactions = _scored_interactions
+
+        with _pending_fires_lock:
+            fires_to_process = list(_pending_fires)
+            _pending_fires.clear()
+        for fire in fires_to_process:
+            fid = fire["interaction_id"]
+            if fid not in _scored_interactions:
+                _scored_interactions.add(fid)
+                _score_fire(fid, fire.get("aim_config"))
+                if interaction_crop_source == "idle":
+                    interaction_crop_source = "interaction"
+                    interaction_id_for_crop = fid
+
         if fire_marker.exists():
             try:
                 marker = json.loads(fire_marker.read_text())
-                interaction_crop_source = "interaction"
-                interaction_id_for_crop = marker.get("interaction_id")
                 fire_marker.unlink(missing_ok=True)
+                fid = marker.get("interaction_id")
+                if fid and fid not in _scored_interactions:
+                    _scored_interactions.add(fid)
+                    _score_fire(fid, marker.get("aim_config"))
+                if interaction_crop_source == "idle":
+                    interaction_crop_source = "interaction"
+                    interaction_id_for_crop = fid
             except Exception:
                 pass
+
+        if len(_scored_interactions) > 200:
+            main._scored_interactions = set(sorted(_scored_interactions)[-100:])
 
         should_capture = False
         if interaction_crop_source == "interaction":
@@ -919,56 +1340,42 @@ def main() -> int:
         elif is_capturing and quota_remaining > 0 and now - last_crop_capture >= _MIN_CROP_INTERVAL:
             should_capture = True
 
-        if should_capture:
-            crop_frame = detection_state.get("frame")
-            crop_dets = detection_state.get("all_detections", [])
-            if crop_frame is not None and crop_dets:
-                try:
-                    extract_and_upload_crops(
-                        frame=crop_frame,
-                        detections=crop_dets,
-                        node_slug=node_slug,
-                        base_url=base_url,
-                        auth_token=auth_token,
-                        crops_dir=crops_dir,
-                        source=interaction_crop_source,
-                        interaction_id=interaction_id_for_crop,
-                        ssl_verify=ssl_verify,
-                        min_crop_size=min_crop_size_setting,
-                        classifier_confidence=classifier_conf,
-                        class_confidence_overrides=class_conf_overrides,
-                        locked_classes=locked_classes,
-                        frames_dir=frames_dir,
-                    )
-                except Exception:
-                    pass
-                last_crop_capture = now
+        with _crop_result_lock:
+            if _crop_result is not None:
+                capture_stats.update(_crop_result)
+                _crop_result = None
 
-        lost_crops = detection_state.get("lost_track_crops", [])
-        if lost_crops:
-            log.info("Lost tracks: %d (capturing=%s quota=%d)", len(lost_crops), is_capturing, quota_remaining)
-        if is_capturing and quota_remaining > 0 and lost_crops:
+        if should_capture and not _crop_thread_busy.is_set():
             crop_frame = detection_state.get("frame")
-            if crop_frame is not None:
-                try:
-                    extract_and_upload_crops(
-                        frame=crop_frame,
-                        detections=lost_crops,
-                        node_slug=node_slug,
-                        base_url=base_url,
-                        auth_token=auth_token,
-                        crops_dir=crops_dir,
-                        source="lost_track",
-                        interaction_id=None,
-                        ssl_verify=ssl_verify,
-                        min_crop_size=min_crop_size_setting,
-                        classifier_confidence=0.0,
-                        class_confidence_overrides={},
-                        locked_classes=set(),
-                        frames_dir=frames_dir,
-                    )
-                except Exception:
-                    pass
+            crop_dets = list(detection_state.get("all_detections", []))
+            lost_crops = detection_state.get("lost_track_crops", [])
+            if lost_crops:
+                crop_dets = crop_dets + list(lost_crops)
+            if crop_frame is not None and crop_dets:
+                _crop_thread_busy.set()
+                last_crop_capture = now
+                crop_kwargs = dict(
+                    node_slug=node_slug, base_url=base_url, auth_token=auth_token,
+                    crops_dir=crops_dir, source=interaction_crop_source,
+                    interaction_id=interaction_id_for_crop, ssl_verify=ssl_verify,
+                    min_crop_size=min_crop_size_setting, classifier_confidence=classifier_conf,
+                    class_confidence_overrides=class_conf_overrides, locked_classes=locked_classes,
+                    frames_dir=frames_dir,
+                )
+                threading.Thread(target=_crop_worker, args=(crop_frame.copy(), crop_dets, crop_kwargs), daemon=True).start()
+
+        # Inject capture_stats into serializable before writing/posting
+        serializable["capture_stats"] = capture_stats
+        try:
+            cv_state_path.write_text(json.dumps(serializable))
+        except Exception:
+            pass
+
+        # Backpressure: enqueue for POST thread, detect next frame immediately
+        if len(post_queue) < _BACKPRESSURE_SLOTS:
+            post_queue.append(serializable)
+            post_ready.set()
+        # else: queue full, server is behind — skip this post, keep detecting
 
         cv_settings_loop = (game_config or {}).get("cv_settings", {})
         active_job = cv_settings_loop.get("active_training_job_id")
@@ -980,7 +1387,7 @@ def main() -> int:
             log.info("Launching training job %d (v%d)", active_job, model_version)
             train_env = os.environ.copy()
             train_env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
-            training_process = subprocess.Popen([
+            classifier_train_args = [
                 cv_python, "-m", "edge.edge_cv_train",
                 "--base-url", base_url,
                 "--node-slug", node_slug,
@@ -989,8 +1396,39 @@ def main() -> int:
                 "--manifest-key", manifest_key,
                 "--model-version", str(model_version),
                 "--crops-dir", str(crops_dir),
-            ] + (["--no-ssl-verify"] if not ssl_verify else []),
-            env=train_env)
+            ]
+            existing_classifier = Path(f"/tmp/cv-models/{node_slug}/classifier.pth")
+            if existing_classifier.exists():
+                classifier_train_args += ["--base-model", str(existing_classifier)]
+            if not ssl_verify:
+                classifier_train_args.append("--no-ssl-verify")
+            training_process = subprocess.Popen(classifier_train_args, env=train_env)
+
+        shot_job = cv_settings_loop.get("active_shot_training_job_id")
+        if shot_job and not training_process and shot_job != failed_training_job_id:
+            training_job_id = shot_job
+            training_job_type = "shot"
+            shot_manifest_key = cv_settings_loop.get("active_shot_training_manifest_key", "")
+            shot_model_version = cv_settings_loop.get("active_shot_model_version", 0) + 1
+            log.info("Launching shot training job %d (v%d)", shot_job, shot_model_version)
+            train_env = os.environ.copy()
+            train_env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+            shot_train_args = [
+                cv_python, "-m", "edge.edge_cv_shot_train",
+                "--base-url", base_url,
+                "--node-slug", node_slug,
+                "--auth-token", auth_token,
+                "--job-id", str(shot_job),
+                "--manifest-key", shot_manifest_key,
+                "--model-version", str(shot_model_version),
+                "--crops-dir", str(crops_dir),
+            ]
+            existing_shot_model = Path(f"/tmp/cv-models/{node_slug}/shot-classifier.pth")
+            if existing_shot_model.exists():
+                shot_train_args += ["--base-model", str(existing_shot_model)]
+            if not ssl_verify:
+                shot_train_args.append("--no-ssl-verify")
+            training_process = subprocess.Popen(shot_train_args, env=train_env)
 
         # YOLO training job launch
         yolo_job = cv_settings_loop.get("active_yolo_training_job_id")
@@ -1002,7 +1440,7 @@ def main() -> int:
             log.info("Launching YOLO training job %d (v%d)", yolo_job, yolo_version)
             train_env = os.environ.copy()
             train_env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
-            training_process = subprocess.Popen([
+            yolo_train_args = [
                 cv_python, "-m", "edge.edge_cv_yolo_train",
                 "--base-url", base_url,
                 "--node-slug", node_slug,
@@ -1011,8 +1449,19 @@ def main() -> int:
                 "--manifest-key", yolo_manifest_key,
                 "--model-version", str(yolo_version),
                 "--frames-dir", str(frames_dir),
-            ] + (["--no-ssl-verify"] if not ssl_verify else []),
-            env=train_env)
+            ]
+            existing_yolo = Path(f"/tmp/cv-models/{node_slug}/yolo-custom.pt")
+            yolo_base = cv_settings_loop.get("cv_yolo_base_model", "yolov8n.pt")
+            last_base = cv_settings_loop.get("_yolo_base_model_used", "yolov8n.pt")
+            if yolo_base != last_base:
+                yolo_train_args += ["--base-model", yolo_base]
+            elif existing_yolo.exists():
+                yolo_train_args += ["--base-model", str(existing_yolo)]
+            elif yolo_base != "yolov8n.pt":
+                yolo_train_args += ["--base-model", yolo_base]
+            if not ssl_verify:
+                yolo_train_args.append("--no-ssl-verify")
+            training_process = subprocess.Popen(yolo_train_args, env=train_env)
 
         if training_process and training_process.poll() is not None:
             exit_code = training_process.returncode
@@ -1036,6 +1485,15 @@ def main() -> int:
                             Path(f"/tmp/cv-models/{node_slug}/yolo-world-labels.txt").unlink(missing_ok=True)
                         except Exception as e:
                             log.error("Failed to load fine-tuned YOLO: %s", e)
+                elif training_job_type == "shot":
+                    model_path = Path(f"/tmp/cv-shot-training/job-{training_job_id}/model.pth")
+                    if model_path.exists():
+                        try:
+                            from edge.edge_cv_shot import load_shot_classifier
+                            shot_classes = load_shot_classifier(model_path)
+                            log.info("Shot classifier hot-swapped: classes=%s", shot_classes)
+                        except Exception as e:
+                            log.error("Failed to load shot classifier: %s", e)
                 else:
                     model_path = Path(f"/tmp/cv-training/job-{training_job_id}/model.pth")
                     if model_path.exists():
@@ -1060,11 +1518,18 @@ def main() -> int:
         if detection_state["targets"]:
             log.debug("Detected %d targets in frame", len(detection_state["targets"]))
 
-        # Backpressure: if queue is full, wait briefly for POST thread to drain
+        # FPS limiting: sleep remaining time to hit target frame rate
+        elapsed = time.time() - now_loop
+        sleep_time = _frame_interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
         if len(post_queue) >= _BACKPRESSURE_SLOTS:
-            time.sleep(0.02)
+            time.sleep(0.01)
 
     log.info("CV runtime shutting down")
+    if _annotated_publisher:
+        _annotated_publisher.stop()
     if _rtsp_source:
         _rtsp_source.stop()
     return 0

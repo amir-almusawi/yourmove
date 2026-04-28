@@ -97,7 +97,7 @@ Current broker settings for the live system:
 
 ## Configure The Firmware
 
-Copy [config.example.h](/home/amir/websites/yourmove/device/esp32_direct/config.example.h) to `config.h`.
+Copy [config.example.h](./config.example.h) to `config.h`.
 
 Then set:
 
@@ -120,7 +120,7 @@ If your relay module triggers when idle, flip:
 
 ## Flash It
 
-1. Open [yourmove_esp32_direct.ino](/home/amir/websites/yourmove/device/esp32_direct/yourmove_esp32_direct.ino).
+1. Open [yourmove_esp32_direct.ino](./yourmove_esp32_direct.ino).
 2. Make sure `config.h` is in the same folder.
 3. Plug in the ESP32-C3 Super Mini over USB.
 4. Select the correct serial port.

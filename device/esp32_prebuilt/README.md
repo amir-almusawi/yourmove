@@ -23,7 +23,7 @@ Use this for hardware that should feel like a product, not a developer kit.
 
 ## Factory Flow
 
-1. Copy [config.example.h](/home/amir/websites/yourmove/device/esp32_prebuilt/config.example.h) to `config.h`
+1. Copy [config.example.h](./config.example.h) to `config.h`
 2. Set a factory serial in `YM_FACTORY_HARDWARE_SERIAL`
 3. Flash the firmware
 4. Reserve a matching claim code for that serial in the dashboard

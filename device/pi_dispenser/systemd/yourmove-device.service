@@ -1,0 +1,17 @@
+[Unit]
+Description=YourMove Pi Dispenser MQTT Client
+After=yourmove-orchestrator.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/yourmove/config.json
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m device.pi_dispenser.dispenser
+WorkingDirectory=/opt/yourmove
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

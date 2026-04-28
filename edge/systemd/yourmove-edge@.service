@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/home/amir/websites/yourmove/edge/run_edge_supervisor.sh %h/.config/yourmove-edge/%i.json
+ExecStart=%h/yourmove/edge/run_edge_supervisor.sh %h/.config/yourmove-edge/%i.json
 Restart=always
 RestartSec=2
 KillMode=control-group

@@ -1,0 +1,16 @@
+[Unit]
+Description=YourMove Pi Dispenser Orchestrator
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m device.pi_dispenser.orchestrator
+WorkingDirectory=/opt/yourmove
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
