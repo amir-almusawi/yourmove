@@ -62,7 +62,9 @@ class PiDispenser:
         })
         self.client.will_set(self._topic("presence"), lwt, qos=1, retain=True)
         self.client.on_connect = self.on_connect
+        self.client.on_disconnect = self.on_disconnect
         self.client.on_message = self.on_message
+        self.client.reconnect_delay_set(min_delay=1, max_delay=30)
 
     def _topic(self, suffix: str) -> str:
         return f"nodes/{self.node_id}/{suffix}"
@@ -175,6 +177,12 @@ class PiDispenser:
         }, retain=True)
         self._publish("capabilities", self.build_capabilities(), retain=True)
         self._publish("state/reported", self.get_state(), retain=True)
+
+    def on_disconnect(self, client, userdata, rc):
+        if rc == 0:
+            log.info("MQTT disconnected cleanly")
+        else:
+            log.warning("MQTT unexpected disconnect (rc=%d), will auto-reconnect", rc)
 
     def on_message(self, client, userdata, msg):
         try:
@@ -309,6 +317,13 @@ class PiDispenser:
     def _telemetry_loop(self):
         while True:
             time.sleep(TELEMETRY_INTERVAL_S)
+            if not self.client.is_connected():
+                log.warning("MQTT not connected, forcing reconnect")
+                try:
+                    self.client.reconnect()
+                except Exception as e:
+                    log.error("Reconnect failed: %s", e)
+                continue
             self._publish("telemetry", self.get_telemetry(), qos=0)
             self._publish("presence", {
                 "state": "online", "runtime_type": "pi_gateway",
@@ -319,7 +334,7 @@ class PiDispenser:
     def run(self):
         log.info("Connecting to MQTT %s:%d as node %d",
                  self.config["mqtt_host"], self.config["mqtt_port"], self.node_id)
-        self.client.connect(self.config["mqtt_host"], self.config["mqtt_port"], keepalive=60)
+        self.client.connect(self.config["mqtt_host"], self.config["mqtt_port"], keepalive=30)
 
         tel_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
         tel_thread.start()
