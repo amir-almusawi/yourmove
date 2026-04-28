@@ -318,13 +318,27 @@ class PiDispenser:
         while True:
             time.sleep(TELEMETRY_INTERVAL_S)
             if not self.client.is_connected():
-                log.warning("MQTT not connected, forcing reconnect")
+                log.warning("MQTT not connected (is_connected=false), forcing reconnect")
                 try:
                     self.client.reconnect()
                 except Exception as e:
                     log.error("Reconnect failed: %s", e)
                 continue
-            self._publish("telemetry", self.get_telemetry(), qos=0)
+            try:
+                info = self.client.publish(
+                    self._topic("telemetry"),
+                    json.dumps(self.get_telemetry()),
+                    qos=0,
+                )
+                if info.rc != 0:
+                    raise RuntimeError(f"publish rc={info.rc}")
+            except Exception as e:
+                log.warning("MQTT publish probe failed (%s), forcing reconnect", e)
+                try:
+                    self.client.reconnect()
+                except Exception as re:
+                    log.error("Reconnect failed: %s", re)
+                continue
             self._publish("presence", {
                 "state": "online", "runtime_type": "pi_gateway",
                 "reason": "heartbeat", "timestamp": _utc_ts(),
